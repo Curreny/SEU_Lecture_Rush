@@ -1,0 +1,8 @@
+/__pycache__/
+.venv
+captcha_images/
+/images/
+/image/
+ehall.seu.edu.cn.har
+
+.env
