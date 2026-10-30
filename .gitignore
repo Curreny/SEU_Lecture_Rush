@@ -9,4 +9,4 @@ ehall.seu.edu.cn.har
 
 .env
 .auth_state/
-
+.DS_Store

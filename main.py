@@ -4,6 +4,7 @@ import json
 import secrets
 from functools import cache
 from getpass import getpass
+from http.cookiejar import LWPCookieJar
 import time
 from pathlib import Path
 import requests
@@ -21,7 +22,7 @@ load_dotenv(override=True)  # 固定读取项目配置，不受终端工作目�
 WID = os.getenv("WID")
 username = os.getenv("username")
 password = os.getenv("password")
-start_time = datetime(2026, 10, 31, 2, 55, 30) # "yyyy-mm-dd hh:mm:ss" 预约开始时间，必须严格按格式输入，否则会报错；到点才允许发commit_code请求
+start_time = datetime(2026, 10, 31, 3, 32, 57) # "yyyy-mm-dd hh:mm:ss" 预约开始时间，必须严格按格式输入，否则会报错；到点才允许发commit_code请求
 PREPARE_SECONDS = 10  # 提前多少秒重新准备；不是服务端确认的验证码有效期。
 
 
@@ -66,8 +67,34 @@ def getkey(session: requests.Session) -> str:
     }
     return request_with_log(session, "CAS：获取加密公钥", "POST", getKey_url, headers=getkey_head, json={}).json()["publicKey"]
 
+def load_trusted_device(session: requests.Session):
+    """为当前账号保留固定设备指纹，并恢复认证站点的 Cookie。"""
+    device_dir = Path(__file__).resolve().parent / ".auth_state" / hashlib.sha256(username.encode()).hexdigest()[:16]
+    device_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fingerprint_path = device_dir / "fingerprint"
+    if not fingerprint_path.exists():
+        fingerprint_path.write_text("stable_" + secrets.token_hex(16), encoding="utf-8")
+    cookies = LWPCookieJar(str(device_dir / "cookies"))
+    if Path(cookies.filename).exists():
+        cookies.load(ignore_discard=True)
+    session.cookies.update(cookies)
+    return fingerprint_path.read_text(encoding="utf-8").strip(), cookies
+
+
+def save_trusted_device(session: requests.Session, cookies: LWPCookieJar):
+    """保留 Cookie 的域、路径和有效期，不保存密码或短信验证码。"""
+    cookies.clear()
+    for cookie in session.cookies:
+        if cookie.domain.lstrip(".") in ("auth.seu.edu.cn", "seu.edu.cn"):
+            cookies.set_cookie(cookie)
+    cookie_path = Path(cookies.filename)
+    cookie_path.touch(mode=0o600, exist_ok=True)
+    cookies.save(ignore_discard=True)
+
+
 def login(session: requests.Session):
-    """使用账号密码登录，服务端要求短信验证时手动输入，不保存登录状态。"""
+    """使用固定设备身份登录，首次或设备信任失效时手动完成短信验证。"""
+    fingerprint, device_cookies = load_trusted_device(session)
     public_key = getkey(session)
     encrypted_password = rsa_encrypt_password(password, public_key)
     login_url = "https://auth.seu.edu.cn/auth/casback/casLogin"
@@ -81,7 +108,8 @@ def login(session: requests.Session):
         "password": encrypted_password,
         "service": "https://vpn.seu.edu.cn:443/passport/v1/auth/cas?sfDomain=CAS-auth",
         "username": username,
-        # "fingerPrint": "stable_1d9cdfb176a1300a73906d5606e00199",
+        "fingerPrint": fingerprint,
+        "rememberTrustDevice": False,
     }
     login_response = request_with_log(session, "CAS：提交登录", "POST", login_url, headers=login_head, json=login_body)
     login_response.raise_for_status()
@@ -110,6 +138,8 @@ def login(session: requests.Session):
         result = login_response.json()
     if result.get("success") is not True or not result.get("redirectUrl"):
         raise RuntimeError(f"CAS 登录未完成：code={result.get('code')}，info={result.get('info')}")
+    save_trusted_device(session, device_cookies)
+    log_progress("已保存本机设备身份和认证 Cookie，下次登录将尝试免短信验证")
     return result
 
 
@@ -260,7 +290,7 @@ def wait_until_start():
         time.sleep(remaining)
 
 
-def reserve_until_success(session: requests.Session):
+def reserve_rush(session: requests.Session):
     """先轮询，再提前准备，最后等到开放时间提交；提交失败则重新准备。"""
     prepare_at = start_time - timedelta(seconds=PREPARE_SECONDS)
     log_progress(
@@ -311,7 +341,6 @@ def reserve_until_success(session: requests.Session):
             continue
         code_finished = time.perf_counter()
         log_progress(f"第 {attempt} 轮｜最终验证码获取完成，准备提交... 耗时{code_finished - check_finished:.3f}s")
-        log_progress(f"距提交时间 {(start_time - datetime.now()).total_seconds():.3f}s；停止刷新，等待提交")
 
         # 第三阶段：准备好后停止请求，等到开放时间直接提交。
         wait_until_start()
@@ -323,7 +352,6 @@ def reserve_until_success(session: requests.Session):
         log_progress(
             f"第 {attempt} 轮｜{'预约成功' if success else '提交结果'}：{result.get('msg', '')}"
             f"（code={result['code']}，datas={result.get('datas')}）｜"
-            f"提交调用时间 {submitted_at:%Y-%m-%d %H:%M:%S.%f}｜"
             f"提交及解析耗时 {submit_elapsed:.3f}s"
         )
         if success:
@@ -344,7 +372,7 @@ def main():
             log_progress("开始建立讲座业务会话（get_cookie2，共 6 步）")
             get_cookie2(session)
             log_progress("业务认证流程已返回，即将进入预约循环")
-            reserve_until_success(session)
+            reserve_rush(session)
     except KeyboardInterrupt:
         log_progress("已手动停止抢座。")
 
