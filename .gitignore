@@ -1,9 +1,12 @@
 /__pycache__/
 .venv
 captcha_images/
+captcha_map_images/
+captcha_hashes_images/
 /images/
 /image/
 ehall.seu.edu.cn.har
 
 .env
 .auth_state/
+
