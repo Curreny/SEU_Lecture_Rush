@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 
 [[package]]
@@ -510,7 +510,7 @@ wheels = [
 ]
 
 [[package]]
-name = "seu-lecture-reserve"
+name = "seu-lecture-rush"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

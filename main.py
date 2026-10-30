@@ -1,7 +1,7 @@
 import base64
-import argparse
 import hashlib
 import json
+import secrets
 from functools import cache
 from getpass import getpass
 import time
@@ -14,18 +14,14 @@ from datetime import datetime, timedelta
 import os
 from dotenv import load_dotenv
 import signal
-# 预约首次查表时再加载，复用认证的采集脚本不依赖已审核标签文件。
-CAPTCHA_MAP_PATH = Path(__file__).resolve().parent / "captcha_hashes_labels.json"
-from auth_state import (
-    AUTH_HEADERS, CAS_SERVICE, REQUEST_TIMEOUT, AuthState,
-    business_session_valid, restore_cas_login,
-)
-
-load_dotenv(override=True)  # 从 .env 文件加载环境变量，覆盖系统环境变量
+import re
+import ddddocr
+ocr = ddddocr.DdddOcr(show_ad=False)
+load_dotenv(override=True)  # 固定读取项目配置，不受终端工作目录影响。
 WID = os.getenv("WID")
 username = os.getenv("username")
 password = os.getenv("password")
-start_time = datetime(2026, 10, 29, 19, 0, 0) # "yyyy-mm-dd hh:mm:ss" 预约开始时间，必须严格按格式输入，否则会报错；到点才允许发commit_code请求
+start_time = datetime(2026, 10, 31, 2, 55, 30) # "yyyy-mm-dd hh:mm:ss" 预约开始时间，必须严格按格式输入，否则会报错；到点才允许发commit_code请求
 PREPARE_SECONDS = 10  # 提前多少秒重新准备；不是服务端确认的验证码有效期。
 
 
@@ -70,22 +66,22 @@ def getkey(session: requests.Session) -> str:
     }
     return request_with_log(session, "CAS：获取加密公钥", "POST", getKey_url, headers=getkey_head, json={}).json()["publicKey"]
 
-def login(session: requests.Session, state: AuthState):
-    """用固定设备身份登录；首次或信任过期时要求手动短信验证。"""
-    if not password:
-        raise ValueError("请先在 .env 中配置 password")
+def login(session: requests.Session):
+    """使用账号密码登录，服务端要求短信验证时手动输入，不保存登录状态。"""
     public_key = getkey(session)
     encrypted_password = rsa_encrypt_password(password, public_key)
     login_url = "https://auth.seu.edu.cn/auth/casback/casLogin"
-    login_head = AUTH_HEADERS
+    login_head = {
+        "Host": "auth.seu.edu.cn",
+        "Origin": "https://auth.seu.edu.cn",
+        "Referer": "https://auth.seu.edu.cn/dist/"
+    }
     login_body = {
         "loginType": "account",
         "password": encrypted_password,
-        "service": CAS_SERVICE,
+        "service": "https://vpn.seu.edu.cn:443/passport/v1/auth/cas?sfDomain=CAS-auth",
         "username": username,
-        "fingerPrint": state.data["fingerprint"],
-        "rememberMe": True,
-        "rememberTrustDevice": False,
+        # "fingerPrint": "stable_1d9cdfb176a1300a73906d5606e00199",
     }
     login_response = request_with_log(session, "CAS：提交登录", "POST", login_url, headers=login_head, json=login_body)
     login_response.raise_for_status()
@@ -93,7 +89,7 @@ def login(session: requests.Session, state: AuthState):
     if str(result.get("code")) == "502":
         sendcode_url = "https://auth.seu.edu.cn/auth/casback/sendStage2Code"
         sendcode_response = session.post(
-            sendcode_url, headers=login_head, json={"userId": username}, timeout=REQUEST_TIMEOUT,
+            sendcode_url, headers=login_head, json={"userId": username},
         )
         sendcode_response.raise_for_status()
         sendcode_result = sendcode_response.json()
@@ -106,16 +102,14 @@ def login(session: requests.Session, state: AuthState):
             raise ValueError("短信验证码必须是 6 位数字")
         # 输入完成后取新公钥，用同一把公钥分别加密原始密码和验证码。
         public_key = getkey(session)
+        login_body["rememberTrustDevice"] = True
         login_body["password"] = rsa_encrypt_password(password, public_key)
         login_body["mobileVerifyCode"] = rsa_encrypt_password(phonecode, public_key)
-        login_body["rememberTrustDevice"] = True
-        login_response = session.post(login_url, headers=login_head, json=login_body, timeout=REQUEST_TIMEOUT)
+        login_response = session.post(login_url, headers=login_head, json=login_body)
         login_response.raise_for_status()
         result = login_response.json()
     if result.get("success") is not True or not result.get("redirectUrl"):
         raise RuntimeError(f"CAS 登录未完成：code={result.get('code')}，info={result.get('info')}")
-    state.remember_login(result)
-    state.save(session)
     return result
 
 
@@ -128,7 +122,7 @@ def get_cookie1(session: requests.Session, redirect_url: str):
     response.raise_for_status()
     return response
 
-def vpn_validation(session: requests.Session, callback_response: requests.Response, state: AuthState):
+def vpn_validation(session: requests.Session, callback_response: requests.Response):
     # 1.保留 CAS 回调结果，取出本次环境上报的auth_ticket
     callback_url = callback_response.url
     callback_params = parse_qs(urlsplit(callback_url).query)
@@ -154,7 +148,7 @@ def vpn_validation(session: requests.Session, callback_response: requests.Respon
 
     # 2.提交reportEnv请求
     if auth_ticket.get("env",{}).get("need"):
-        device_id = state.data["vpn_device_id"]
+        device_id = "00" + secrets.token_hex(32)
         reportEnv_url = "https://vpn.seu.edu.cn/controller/v1/public/reportEnv"
         reportEnv_body = {
             "ticket": auth_ticket["ticket"],
@@ -229,13 +223,6 @@ def appiontCheck(session: requests.Session):
 
     return response.text
 
-
-@cache
-def load_captcha_map() -> dict[str, str]:
-    """首次预约查表时读取并缓存已审核标签；文件缺失或格式错误直接抛出。"""
-    with CAPTCHA_MAP_PATH.open(encoding="utf-8") as captcha_map_file:
-        return json.load(captcha_map_file)
-
 def get_code(session: requests.Session) -> str:
     """请求当前会话的新验证码，按图片字节的 SHA-256 返回已审核标签；未收录时直接抛错。"""
     # 步骤 1：请求新验证码，并检查接口是否成功。
@@ -249,8 +236,9 @@ def get_code(session: requests.Session) -> str:
     data_url = result["datas"]
     # 步骤 2：直接解码图片字节，省去本地文件读写。
     image_bytes = base64.b64decode(data_url.split(",", 1)[1], validate=True)
-    # 步骤 3：直接查找真实标签。
-    return load_captcha_map()[hashlib.sha256(image_bytes).hexdigest()]
+    # 步骤 3：ddddocr识别验证码
+    captcha_text = ocr.classification(image_bytes)
+    return captcha_text
 
 def commit_code(session: requests.Session, captcha_text):
     """沿用获取验证码的会话，以网页相同的表单格式提交预约；会实际创建预约。"""
@@ -263,21 +251,6 @@ def commit_code(session: requests.Session, captcha_text):
     response.raise_for_status()
     return response.text
 
-# def get_reserve_num(session: requests.Session):
-#     """获取当前预约人数"""
-#     url = "https://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu/modules/hdyy/getActivityDetail.do"
-#     body = {
-#         "wid": WID
-#     }
-#     response = session.post(url, data=body)
-#     response.raise_for_status()
-#     result = response.json()
-#     YYRS = int(result["datas"]["hdxq"]["YYRS"])
-#     HDZRS = int(result["datas"]["hdxq"]["HDZRS"])
-
-#     return YYRS, HDZRS
-
-
 def wait_until_start():
     """按本机时间等待开放，不发送网络请求；每次唤醒重新检查，防止提前提交。"""
     while True:
@@ -288,107 +261,89 @@ def wait_until_start():
 
 
 def reserve_until_success(session: requests.Session):
-    """早期连续轮询，进入准备窗口后重新取码并等待提交；失败重新准备，异常直接抛出。"""
+    """先轮询，再提前准备，最后等到开放时间提交；提交失败则重新准备。"""
     prepare_at = start_time - timedelta(seconds=PREPARE_SECONDS)
     log_progress(
         f"开始无间隔轮询，WID={WID}，重新准备时间={prepare_at:%Y-%m-%d %H:%M:%S}，"
         f"提交开始时间={start_time:%Y-%m-%d %H:%M:%S}"
     )
     
+    # 第一阶段：距离开放还有 10 秒以上，只轮询，不提交。
+    while datetime.now() < prepare_at:
+        started = time.perf_counter()
+        check = json.loads(appiontCheck(session))
+        check_finished = time.perf_counter()
+        # 请求回来时若已到准备时间，直接进入第二阶段，重新检查并取码。
+        if datetime.now() >= prepare_at:
+            break
+        if str(check["code"]) == "0":
+            get_code(session)  # 早期验证码只用于轮询，最终提交前会重新获取。
+            log_progress(
+                f"早期轮询完成｜资格检查 {check_finished - started:.3f}s｜"
+                f"获取验证码请求 {time.perf_counter() - check_finished:.3f}s｜"
+                f"距离提交时间 {(start_time - datetime.now()).total_seconds():.3f}s"
+            )
+        else:
+            log_progress(
+                f"早期轮询｜资格未通过：{check.get('msg', '')}（code={check['code']}）"
+                f"｜耗时 {time.perf_counter() - started:.3f}s"
+            )
+
+    # 第二阶段：进入开放前 10 秒，重新检查资格并准备最终提交的验证码。
     attempt = 0
     while True:
         attempt += 1
         started = time.perf_counter()
-        # 步骤 1：以请求开始前的时间区分阶段，不沿用准备窗口之前发起的资格检查。
-        preparing = datetime.now() >= prepare_at
         check = json.loads(appiontCheck(session))
+        
         check_finished = time.perf_counter()
-        if str(check["code"]) == "0":
-            if not preparing and datetime.now() >= prepare_at:
-                log_progress(
-                    f"第 {attempt} 轮｜资格检查 {check_finished - started:.3f}s｜"
-                    "已进入准备窗口，下一轮重新检查资格并取码"
-                )
-                continue
-            # 步骤 2：重新取码；早期轮询所得验证码不用于最终提交。
-            captcha_text = get_code(session)
-            code_finished = time.perf_counter()
-            if not preparing:
-                log_progress(
-                    f"第 {attempt} 轮｜早期轮询完成｜资格检查 {check_finished - started:.3f}s｜"
-                    f"验证码请求及查表 {code_finished - check_finished:.3f}s｜"
-                    f"总耗时 {code_finished - started:.3f}s｜"
-                    f"距重新准备 {(prepare_at - datetime.now()).total_seconds():.3f}s"
-                )
-                continue
-            log_progress(
-                f"第 {attempt} 轮｜准备就绪｜资格检查 {check_finished - started:.3f}s｜"
-                f"验证码请求及查表 {code_finished - check_finished:.3f}s｜"
-                f"距提交时间 {(start_time - datetime.now()).total_seconds():.3f}s；停止刷新，等待提交"
-            )
-            # 步骤 3：等待期间保留本轮会话和验证码，到点后直接提交，不再插入前置请求。
-            wait_until_start()
-            submitted_at = datetime.now()
-            submit_started = time.perf_counter()
-            result = json.loads(commit_code(session, captcha_text))
-            submit_elapsed = time.perf_counter() - submit_started
-            success = str(result["code"]) == "0" and str(result["datas"]) == "1"
-            log_progress(
-                f"第 {attempt} 轮｜{'预约成功' if success else '提交结果'}：{result.get('msg', '')}"
-                f"（code={result['code']}，datas={result.get('datas')}）｜"
-                f"提交调用时间 {submitted_at:%Y-%m-%d %H:%M:%S.%f}｜"
-                f"距开放 {(submitted_at - start_time).total_seconds():.3f}s｜"
-                f"提交及解析耗时 {submit_elapsed:.3f}s"
-            )
-            # 步骤 4：确认成功后退出；业务失败重新检查资格并取码，不复用已提交的验证码。
-            if success:
-                return result
-        else:
+        if str(check["code"]) != "0":
             log_progress(
                 f"第 {attempt} 轮｜资格未通过：{check.get('msg', '')}（code={check['code']}）"
-                f"｜耗时 {time.perf_counter() - started:.3f}s"
+                f"｜耗时 {check_finished - started:.3f}s"
             )
+            continue
+        log_progress(f"第 {attempt} 轮｜最终资格检查完成，等待获取验证码... 耗时{check_finished - started:.3f}s")
 
+        captcha_text = get_code(session)
+        if re.fullmatch(r"[0-9]{4}", captcha_text) is None:
+            print(f"第 {attempt} 轮验证码格式错误：{captcha_text!r}，跳过提交，重新检查预约资格", flush=True)
+            continue
+        code_finished = time.perf_counter()
+        log_progress(f"第 {attempt} 轮｜最终验证码获取完成，准备提交... 耗时{code_finished - check_finished:.3f}s")
+        log_progress(f"距提交时间 {(start_time - datetime.now()).total_seconds():.3f}s；停止刷新，等待提交")
 
-def authenticate(session: requests.Session, state: AuthState):
-    """依次尝试业务 Cookie、CAS 凭据、账号密码，认证成功后再交给预约流程。"""
-    if session.cookies and business_session_valid(session):
-        print("已恢复有效的讲座系统会话，无需重新登录。")
-        state.save(session)
-        return
-    result = restore_cas_login(session, state)
-    if result is None:
-        print("已有会话不可用，使用已保存的设备身份重新登录。")
-        result = login(session, state)
-    else:
-        print("已恢复 CAS 登录，无需短信验证码。")
-        state.save(session)
-    callback_response = get_cookie1(session, result["redirectUrl"])
-    vpn_validation(session, callback_response, state)
-    get_cookie2(session)
-    if not business_session_valid(session):
-        raise RuntimeError("认证后仍无法取得个人讲座信息，已停止预约；请检查登录流程")
-    state.save(session)
-    print("讲座系统认证成功，认证状态已保存。")
-
+        # 第三阶段：准备好后停止请求，等到开放时间直接提交。
+        wait_until_start()
+        submitted_at = datetime.now()
+        submit_started = time.perf_counter()
+        result = json.loads(commit_code(session, captcha_text))
+        submit_elapsed = time.perf_counter() - submit_started
+        success = str(result["code"]) == "0" and str(result["datas"]) == "1"
+        log_progress(
+            f"第 {attempt} 轮｜{'预约成功' if success else '提交结果'}：{result.get('msg', '')}"
+            f"（code={result['code']}，datas={result.get('datas')}）｜"
+            f"提交调用时间 {submitted_at:%Y-%m-%d %H:%M:%S.%f}｜"
+            f"提交及解析耗时 {submit_elapsed:.3f}s"
+        )
+        if success:
+            return result
+        # 提交失败则回到第二阶段，重新检查、取码并提交。
 
 def main():
-    """沿用同一会话完成 CAS、VPN 和业务认证；无论成功失败都关闭连接。"""
-    parser = argparse.ArgumentParser(description="讲座预约与登录状态复用")
-    parser.add_argument("--auth-only", action="store_true", help="只完成认证和缓存检查，不提交预约")
-    args = parser.parse_args()
-    state = AuthState(username)
-    session = requests.Session()
-    restored = False
-    # 公钥和登录必须沿用同一组 Cookie；响应下发的新 Cookie 由 Session 接收。
-    
+    """认证一次后进入预约循环；异常向外抛出，成功、异常或 Ctrl+C 退出时均关闭连接。"""
+
     try:
-        state.restore(session)
-        restored = True
-        # 首次也先落盘设备身份，中断后重启仍使用同一标识。
-        state.save(session)
-        authenticate(session, state)
-        if not args.auth_only:
+        with requests.Session() as session:
+            session.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36 Edg/155.0.0.0"
+            log_progress("开始 CAS 登录认证")
+            result = login(session)
+            log_progress("CAS 登录成功")
+            callback_response = get_cookie1(session, result["redirectUrl"])
+            vpn_validation(session, callback_response)
+            log_progress("开始建立讲座业务会话（get_cookie2，共 6 步）")
+            get_cookie2(session)
+            log_progress("业务认证流程已返回，即将进入预约循环")
             reserve_until_success(session)
     except KeyboardInterrupt:
         log_progress("已手动停止抢座。")
