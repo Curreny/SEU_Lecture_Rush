@@ -6,3 +6,4 @@ captcha_images/
 ehall.seu.edu.cn.har
 
 .env
+.auth_state/

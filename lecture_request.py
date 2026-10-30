@@ -3,7 +3,6 @@ import argparse
 import json
 import re
 from getpass import getpass
-import secrets
 import time
 from pathlib import Path
 import ddddocr
@@ -14,15 +13,17 @@ from urllib.parse import urlsplit, parse_qs, unquote
 from datetime import datetime
 import os
 from dotenv import load_dotenv
-# 与 main.py 一样复用识别器，避免每次获取验证码都重新加载模型。
-ocr = ddddocr.DdddOcr(show_ad=False)
+from auth_state import (
+    AUTH_HEADERS, CAS_SERVICE, REQUEST_TIMEOUT, AuthState,
+    business_session_valid, restore_cas_login,
+)
+# 第一次识别图形验证码时才加载模型；只检查登录时无需加载。
+ocr = None
 
 load_dotenv(override=True)  # 从 .env 文件加载环境变量，覆盖系统环境变量
 WID = os.getenv("WID")
 username = os.getenv("username")
 password = os.getenv("password")
-print(username)
-print(password)
 start_time = datetime(2026, 10, 26, 12, 26, 15) # "yyyy-mm-dd hh:mm:ss" 预约开始时间，必须严格按格式输入，否则会报错；到点才允许发commit_code请求
 POLL_INTERVAL = 0 # 每轮结束后等待的秒数，可自行调整；Ctrl+C 停止。
 
@@ -49,32 +50,59 @@ def getkey(session: requests.Session) -> str:
         "Origin": "https://auth.seu.edu.cn",
         "Referer": "https://auth.seu.edu.cn/dist/",
     }
-    return session.post(getKey_url, headers=getkey_head, json={}).json()["publicKey"]
+    response = session.post(getKey_url, headers=getkey_head, json={}, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    result = response.json()
+    if result.get("success") is not True or not result.get("publicKey"):
+        raise RuntimeError("获取登录公钥失败")
+    return result["publicKey"]
 
-def login(session: requests.Session):
-    """执行一次 CAS 登录并保留会话；登录失败或要求二次认证时直接报告错误。"""
+def login(session: requests.Session, state: AuthState):
+    """用固定设备身份登录；首次或信任过期时要求手动短信验证。"""
+    if not password:
+        raise ValueError("请先在 .env 中配置 password")
     public_key = getkey(session)
     encrypted_password = rsa_encrypt_password(password, public_key)
     login_url = "https://auth.seu.edu.cn/auth/casback/casLogin"
-    login_head = {
-        "Host": "auth.seu.edu.cn",
-        "Origin": "https://auth.seu.edu.cn",
-        "Referer": "https://auth.seu.edu.cn/dist/"
-    }
+    login_head = AUTH_HEADERS
     login_body = {
         "loginType": "account",
         "password": encrypted_password,
-        "service": "https://vpn.seu.edu.cn:443/passport/v1/auth/cas?sfDomain=CAS-auth",
+        "service": CAS_SERVICE,
         "username": username,
+        "fingerPrint": state.data["fingerprint"],
+        "rememberMe": True,
+        "rememberTrustDevice": False,
     }
-    login_response = session.post(login_url, headers=login_head, json=login_body)
+    login_response = session.post(login_url, headers=login_head, json=login_body, timeout=REQUEST_TIMEOUT)
     login_response.raise_for_status()
     result = login_response.json()
-    if result.get("success") is not True or result.get("needStage2Validation"):
-        raise RuntimeError(
-            f"CAS 登录未完成：code={result.get('code')}，"
-            f"info={result.get('info')}，二次认证={result.get('needStage2Validation')}"
+    if str(result.get("code")) == "502":
+        sendcode_url = "https://auth.seu.edu.cn/auth/casback/sendStage2Code"
+        sendcode_response = session.post(
+            sendcode_url, headers=login_head, json={"userId": username}, timeout=REQUEST_TIMEOUT,
         )
+        sendcode_response.raise_for_status()
+        sendcode_result = sendcode_response.json()
+        if sendcode_result.get("success") is not True or str(sendcode_result.get("code")) != "200":
+            raise RuntimeError(f"短信发送失败：code={sendcode_result.get('code')}，info={sendcode_result.get('info')}")
+        print(sendcode_result.get("info"))
+
+        phonecode = input("请输入手机收到的验证码：").strip()
+        if re.fullmatch(r"[0-9]{6}", phonecode) is None:
+            raise ValueError("短信验证码必须是 6 位数字")
+        # 输入完成后取新公钥，用同一把公钥分别加密原始密码和验证码。
+        public_key = getkey(session)
+        login_body["password"] = rsa_encrypt_password(password, public_key)
+        login_body["mobileVerifyCode"] = rsa_encrypt_password(phonecode, public_key)
+        login_body["rememberTrustDevice"] = True
+        login_response = session.post(login_url, headers=login_head, json=login_body, timeout=REQUEST_TIMEOUT)
+        login_response.raise_for_status()
+        result = login_response.json()
+    if result.get("success") is not True or not result.get("redirectUrl"):
+        raise RuntimeError(f"CAS 登录未完成：code={result.get('code')}，info={result.get('info')}")
+    state.remember_login(result)
+    state.save(session)
     return result
 
 
@@ -87,7 +115,7 @@ def get_cookie1(session: requests.Session, redirect_url: str):
     response.raise_for_status()
     return response
 
-def vpn_validation(session: requests.Session, callback_response: requests.Response):
+def vpn_validation(session: requests.Session, callback_response: requests.Response, state: AuthState):
     # 1.保留 CAS 回调结果，取出本次环境上报的auth_ticket
     callback_url = callback_response.url
     callback_params = parse_qs(urlsplit(callback_url).query)
@@ -113,7 +141,7 @@ def vpn_validation(session: requests.Session, callback_response: requests.Respon
 
     # 2.提交reportEnv请求
     if auth_ticket.get("env",{}).get("need"):
-        device_id = "00" + secrets.token_hex(32)
+        device_id = state.data["vpn_device_id"]
         reportEnv_url = "https://vpn.seu.edu.cn/controller/v1/public/reportEnv"
         reportEnv_body = {
             "ticket": auth_ticket["ticket"],
@@ -150,17 +178,15 @@ def get_cookie2(session: requests.Session):
     url = "https://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu/*default/index.do"
     response = session.get(url, allow_redirects=False)
     response.raise_for_status()
-    location = response.headers["Location"]#拿到https://vpn.seu.edu.cn:443/controller/v1/public/verify?t=xxxxxxx的url地址
-
-    # 步骤 2：验证成功后由服务器提供两个业务参数，不硬编码抓包中的值。
-    verify_url = location
-    verify_response = session.get(verify_url, allow_redirects=False)
-    verify_response.raise_for_status()
-    app_url = verify_response.headers["Location"] #拿到https://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu/*default/index.do?sdpAppCode=xxxx&unitId=xxxx
-
-    # 步骤 3：访问验证后的入口，只有响应下发非空会话 Cookie 才算完成。
-    app_response = session.get(app_url, allow_redirects=False) #直接请求这个app_url, 响应体里的set-cookie获得sdp_app_session-legacy-443和sdp_app_session-443
-    app_response.raise_for_status()
+    app_url = url
+    if response.is_redirect:
+        # VPN 已有效时入口可直接返回 200，无需重复执行这组跳转。
+        verify_url = response.headers["Location"]
+        verify_response = session.get(verify_url, allow_redirects=False)
+        verify_response.raise_for_status()
+        app_url = verify_response.headers["Location"]
+        app_response = session.get(app_url, allow_redirects=False)
+        app_response.raise_for_status()
 
     # 再发一次url的请求拿到route
     route_response = session.get(url, allow_redirects=False)
@@ -172,11 +198,16 @@ def get_cookie2(session: requests.Session):
         "service": "http://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu/*default/index.do"
     }
     ticket_response = session.post(ticket_url, json=ticket_body)
-    ticket_redirect_url = ticket_response.json()["redirectUrl"] # 拿到http://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu/*default/index.do?ticket=ST-xxxxx
+    ticket_response.raise_for_status()
+    ticket_result = ticket_response.json()
+    if ticket_result.get("success") is not True or not ticket_result.get("redirectUrl"):
+        raise RuntimeError(f"业务 Ticket 获取失败：code={ticket_result.get('code')}")
+    ticket_redirect_url = ticket_result["redirectUrl"]
 
     # 向ticket_redirect_url请求，拿set-cookie:GS_SESSIONID
     # 同时重定向到http://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu/*default/index.do，获取_WEU，更新JSESSIONID
     GS_response = session.get(ticket_redirect_url)
+    GS_response.raise_for_status()
     
     return app_url
 
@@ -191,6 +222,7 @@ def appiontCheck(session: requests.Session):
 
 def get_code(session: requests.Session) -> str:
     """请求、解码并识别当前会话的新验证码；返回原始识别字符串，由预约循环校验格式。"""
+    global ocr
     # 步骤 1：请求新验证码，并检查接口是否成功。
     time_stamp = int(time.time() * 1000)
     url = f"https://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu/modules/hdyy/vcode.do"
@@ -203,6 +235,8 @@ def get_code(session: requests.Session) -> str:
     # 步骤 2：直接解码图片字节，省去本地文件读写。
     image_bytes = base64.b64decode(data_url.split(",", 1)[1], validate=True)
     # 步骤 3：直接识别内存中的图片，不保存文件，也不猜改识别结果。
+    if ocr is None:
+        ocr = ddddocr.DdddOcr(show_ad=False)
     captcha_text = ocr.classification(image_bytes)
     return image_bytes, captcha_text
 
@@ -251,25 +285,54 @@ def reserve_until_success(session: requests.Session):
         time.sleep(POLL_INTERVAL)
 
 
+def authenticate(session: requests.Session, state: AuthState):
+    """依次尝试业务 Cookie、CAS 凭据、账号密码，认证成功后再交给预约流程。"""
+    if session.cookies and business_session_valid(session):
+        print("已恢复有效的讲座系统会话，无需重新登录。")
+        state.save(session)
+        return
+    result = restore_cas_login(session, state)
+    if result is None:
+        print("已有会话不可用，使用已保存的设备身份重新登录。")
+        result = login(session, state)
+    else:
+        print("已恢复 CAS 登录，无需短信验证码。")
+        state.save(session)
+    callback_response = get_cookie1(session, result["redirectUrl"])
+    vpn_validation(session, callback_response, state)
+    get_cookie2(session)
+    if not business_session_valid(session):
+        raise RuntimeError("认证后仍无法取得个人讲座信息，已停止预约；请检查登录流程")
+    state.save(session)
+    print("讲座系统认证成功，认证状态已保存。")
+
+
 def main():
     """沿用同一会话完成 CAS、VPN 和业务认证；无论成功失败都关闭连接。"""
+    parser = argparse.ArgumentParser(description="讲座预约与登录状态复用")
+    parser.add_argument("--auth-only", action="store_true", help="只完成认证和缓存检查，不提交预约")
+    args = parser.parse_args()
+    state = AuthState(username)
     session = requests.Session()
-    session.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36 Edg/155.0.0.0"
+    restored = False
     # 公钥和登录必须沿用同一组 Cookie；响应下发的新 Cookie 由 Session 接收。
     
     try:
-        result = login(session)
-        print("CAS 登录成功")
-        callback_response = get_cookie1(session, result["redirectUrl"])
-        vpn_validation(session, callback_response)
-        get_cookie2(session)
-        
-        # # print("会话 Cookie:",session.cookies.get_dict())  # 获取所有 Cookie 的字典形式
-        reserve_until_success(session)
+        state.restore(session)
+        restored = True
+        # 首次也先落盘设备身份，中断后重启仍使用同一标识。
+        state.save(session)
+        authenticate(session, state)
+        if not args.auth_only:
+            reserve_until_success(session)
     except KeyboardInterrupt:
         print("已手动停止抢座。")
     finally:
-        session.close()
+        try:
+            if restored:
+                state.save(session)
+        finally:
+            session.close()
 
 
 if __name__ == "__main__":
